@@ -1,0 +1,102 @@
+
+import glob
+import os
+import pandas as pd
+import itertools
+basedir = ""
+
+
+def get_prefixes(path,chip=4):
+	return sorted(set(["_".join(os.path.basename(file)[::-1].split("_")[3:])[::-1] for file in glob.glob("%s/*.gz"%path)]))
+
+
+def get_fr_rr(sample,path):
+	global basedir
+	R1 = sorted(glob.glob(os.path.join(basedir,"rnaseq","%s*R1*.gz"%sample)))
+	R2 = sorted(glob.glob(os.path.join(basedir,"rnaseq","%s*R2*.gz"%sample)))
+	return pd.DataFrame(dict(R1=tuple(R1),R2=tuple(R2)))
+
+
+
+def get_group_files(sample,dm):
+	g = dm[dm["sample"] == sample]["group"].values[0]
+#	print(g)
+	return dm[dm["group"] == g]["sample"].values
+
+
+
+
+designmatrix = pd.read_csv("./design_matrix_dec_2019_rnaseq.csv")
+
+
+rule all:
+	input:
+		salmon=expand("quant/salmon/{sample}/quant.sf",sample=designmatrix["sample"].values),
+		kallisto=expand("quant/kallisto/{sample}/abundance.h5",sample=designmatrix["sample"].values)
+
+
+rule concatenate:
+	input:
+		files=lambda wildcards: list(itertools.chain(*get_fr_rr(wildcards.sample,"").values)),
+		R1=lambda wildcards: get_fr_rr(wildcards.sample,"").R1.values,
+		R2=lambda wildcards: get_fr_rr(wildcards.sample,"").R2.values
+	output:
+		R1=temporary("tmp/{sample}_R1.fq.gz"),
+		R2=temporary("tmp/{sample}_R2.fq.gz")
+	threads: 4
+	shell:
+		"cat {input.R1} > {output.R1} && cat {input.R2} > {output.R2}"
+
+
+rule trimming:
+	input: 
+		rules.concatenate.output
+
+	output:
+		expand("trimmed/{{sample}}_val_{n}.fq.gz",n=[1,2])
+	threads: 6	
+	shell:
+		"trim_galore -j {threads} --fastqc --gzip --paired -o trimmed --basename {wildcards.sample} {input}"
+
+rule hisat:
+	input:
+		R1="trimmed/{sample}_val_1.fq.gz",
+		R2="trimmed/{sample}_val_2.fq.gz"
+	params:
+		index="index/genomic/hisat2/hg19"
+	threads: 4
+	output:
+		"align/{sample}.bam"
+	shell:
+		"hisat2 -x {params.index} --dta -1 {input.R1} -2 {input.R2} | samtools view -bu | samtools sort -@ {threads} -T /dev/shm -o {output} && samtools index {output}"
+
+
+rule salmon:
+	input:
+		R1="trimmed/{sample}_val_1.fq.gz",
+		R2="trimmed/{sample}_val_2.fq.gz"
+	params:
+		index="index/pseudo/salmon/hg19"
+	threads: 4
+	output:
+		quant="quant/salmon/{sample}/quant.sf",
+		#folder=directory("quant/salmon/{sample}")
+	log: 
+		"log/quant/salmon/{sample}.log"	
+	shell:
+		"salmon quant --no-version-check -i {params.index} -l IU -1 {input.R1} -2 {input.R2} --validateMappings --threads {threads} --numBootstraps 100 --gcBias  -o quant/salmon/{wildcards.sample} 2> {log}"
+
+rule kallisto:
+	input:
+		R1="trimmed/{sample}_val_1.fq.gz",
+		R2="trimmed/{sample}_val_2.fq.gz"
+	params:
+		index="index/pseudo/kallisto/hg19"
+	threads: 8
+	output:
+		"quant/kallisto/{sample}/abundance.h5"
+	shell:
+		"kallisto quant -t {threads} -i {params.index} -o quant/kallisto/{wildcards.sample} -b 100 {input.R1} {input.R2}"
+	
+
+
